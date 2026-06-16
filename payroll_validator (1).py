@@ -23,10 +23,15 @@ OUTPUT_PATH = Path("/home/claude/MRS_Payroll_Validation_Report.xlsx")
 
 VALID_PAY_TYPES = {"hourly", "piece_rate", "salary"}
 MIN_WAGE        = {"CA": 16.50, "TX": 7.25, "FL": 13.00, "NY": 16.00, "WA": 16.28}
-FLSA_OT_THRESHOLD   = 40.0
+FLSA_OT_THRESHOLD     = 40.0
 CA_DAILY_OT_THRESHOLD = 8.0
 CA_DAILY_DT_THRESHOLD = 12.0
 CA_MEAL_BREAK_TRIGGER = 5.0
+
+# Grupo 6 — Reconciliation thresholds
+INDIVIDUAL_GROSS_VARIANCE = 0.40   # R22: flag if individual gross varies >40% vs personal avg
+COMPANY_GROSS_VARIANCE    = 0.15   # R23: flag if company total gross varies >15% week-over-week
+HOURS_STDEV_MULTIPLIER    = 2.0    # R24: flag if hours > mean + 2 std deviations
 
 # ─── BRAND COLORS (navy/teal MRS palette) ────────────────────────────────────
 
@@ -84,6 +89,132 @@ def load_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["week_ending"])
     df["week_ending"] = pd.to_datetime(df["week_ending"]).dt.date
     return df
+
+
+# ─── GROSS PAY CALCULATOR ────────────────────────────────────────────────────
+
+def compute_gross_pay(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates gross_pay per row based on pay_type.
+      hourly/salary  → (regular_hours × hourly_rate) + (ot_hours × hourly_rate × 1.5)
+      piece_rate     → pieces_completed × piece_rate_usd
+    Records with missing/zero rates produce gross_pay = 0 (already flagged by R03).
+    """
+    df = df.copy()
+
+    def _gross(row):
+        pt = row["pay_type"]
+        if pt in ("hourly", "salary"):
+            hr = row["hourly_rate"] if not pd.isna(row["hourly_rate"]) else 0
+            return (row["regular_hours"] * hr) + (row["ot_hours"] * hr * 1.5)
+        elif pt == "piece_rate":
+            pr  = row["piece_rate_usd"] if not pd.isna(row["piece_rate_usd"]) else 0
+            pcs = row["pieces_completed"] if not pd.isna(row["pieces_completed"]) else 0
+            return pcs * pr
+        return 0.0
+
+    df["gross_pay"] = df.apply(_gross, axis=1).round(2)
+    return df
+
+
+# ─── RECONCILIATION ENGINE (Grupo 6) ─────────────────────────────────────────
+
+def run_reconciliations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Grupo 6 — Variance reconciliation rules.
+    Requires gross_pay column (run compute_gross_pay first).
+    Operates at group level across weeks, not row by row.
+    """
+    flags = []
+    weeks_sorted = sorted(df["week_ending"].unique())
+
+    def flag(eid, name, state, ptype, week, rule_id, severity, description, impact):
+        flags.append({
+            "employee_id":      eid,
+            "employee_name":    name,
+            "state":            state,
+            "pay_type":         ptype,
+            "week_ending":      week,
+            "rule_id":          rule_id,
+            "severity":         severity,
+            "description":      description,
+            "potential_impact": impact,
+        })
+
+    # R22 — Individual gross pay variance >40% vs personal historical avg
+    for eid, emp_df in df.groupby("employee_id"):
+        emp_df = emp_df.sort_values("week_ending")
+        name   = emp_df["employee_name"].iloc[0]
+        state  = emp_df["state"].iloc[0]
+        ptype  = emp_df["pay_type"].iloc[0]
+
+        for i, (_, row) in enumerate(emp_df.iterrows()):
+            if i == 0:
+                continue
+            prior_avg = emp_df.iloc[:i]["gross_pay"].mean()
+            if prior_avg == 0:
+                continue
+            current  = row["gross_pay"]
+            variance = abs(current - prior_avg) / prior_avg
+            if variance > INDIVIDUAL_GROSS_VARIANCE:
+                direction = "increase" if current > prior_avg else "decrease"
+                flag(eid, name, state, ptype, row["week_ending"],
+                     "R22", "HIGH",
+                     f"Gross pay ${current:,.2f} is {variance:.0%} {direction} vs personal avg ${prior_avg:,.2f}",
+                     f"Verify no duplicate entries, rate changes, or hours errors ({direction} >{INDIVIDUAL_GROSS_VARIANCE:.0%})")
+
+    # R23 — Company-level total gross variance >15% week over week
+    weekly_totals = (
+        df.groupby("week_ending")["gross_pay"]
+        .sum()
+        .reset_index()
+        .sort_values("week_ending")
+    )
+    for i in range(1, len(weekly_totals)):
+        prev_week = weekly_totals.iloc[i - 1]
+        curr_week = weekly_totals.iloc[i]
+        if prev_week["gross_pay"] == 0:
+            continue
+        variance = (curr_week["gross_pay"] - prev_week["gross_pay"]) / prev_week["gross_pay"]
+        if abs(variance) > COMPANY_GROSS_VARIANCE:
+            direction = "increase" if variance > 0 else "decrease"
+            flag("COMPANY", "Master Roofing Solutions", "ALL", "ALL",
+                 curr_week["week_ending"],
+                 "R23", "HIGH",
+                 (f"Total payroll ${curr_week['gross_pay']:,.2f} is {abs(variance):.0%} {direction} "
+                  f"vs prior week ${prev_week['gross_pay']:,.2f}"),
+                 "Review headcount changes, rate adjustments, and hours spikes before processing")
+
+    # R24 — Individual hours spike >2 std deviations vs personal historical
+    for eid, emp_df in df.groupby("employee_id"):
+        emp_df = emp_df.sort_values("week_ending")
+        name   = emp_df["employee_name"].iloc[0]
+        state  = emp_df["state"].iloc[0]
+        ptype  = emp_df["pay_type"].iloc[0]
+        emp_df = emp_df.copy()
+        emp_df["total_hours"] = emp_df["regular_hours"] + emp_df["ot_hours"]
+
+        for i, (_, row) in enumerate(emp_df.iterrows()):
+            if i < 2:
+                continue
+            prior = emp_df.iloc[:i]["total_hours"]
+            mean_h, std_h = prior.mean(), prior.std()
+            if std_h == 0:
+                continue
+            threshold = mean_h + HOURS_STDEV_MULTIPLIER * std_h
+            current_h = row["total_hours"]
+            if current_h > threshold:
+                flag(eid, name, state, ptype, row["week_ending"],
+                     "R24", "MEDIUM",
+                     (f"Hours this week ({current_h:.1f}h) exceed personal threshold "
+                      f"({threshold:.1f}h = mean {mean_h:.1f}h + 2σ {std_h:.1f}h)"),
+                     "Verify timecard accuracy; possible data entry error or unauthorized overtime")
+
+    return pd.DataFrame(flags) if flags else pd.DataFrame(columns=[
+        "employee_id","employee_name","state","pay_type","week_ending",
+        "rule_id","severity","description","potential_impact"
+    ])
+
 
 # ─── VALIDATION ENGINE ───────────────────────────────────────────────────────
 
@@ -224,7 +355,8 @@ def build_summary(wb: Workbook, df: pd.DataFrame, flags: pd.DataFrame):
     total_records  = len(df)
     total_employees= df["employee_id"].nunique()
     total_flags    = len(flags)
-    clean_records  = total_records - flags["employee_id"].nunique()
+    flagged_employees = flags[flags["employee_id"] != "COMPANY"]["employee_id"].nunique()
+    clean_records     = total_employees - flagged_employees
     critical_count = len(flags[flags["severity"] == "CRITICAL"])
     high_count     = len(flags[flags["severity"] == "HIGH"])
     medium_count   = len(flags[flags["severity"] == "MEDIUM"])
@@ -305,6 +437,9 @@ def build_summary(wb: Workbook, df: pd.DataFrame, flags: pd.DataFrame):
         "R08": "Piece-rate effective hourly < state minimum wage",
         "R10": "CA meal break premium owed (1st break)",
         "R11": "CA 2nd meal break premium may apply",
+        "R22": "Individual gross pay variance >40% vs personal avg",
+        "R23": "Company total payroll variance >15% week-over-week",
+        "R24": "Employee hours spike >2 std deviations vs personal historical",
     }
 
     headers = ["Rule", "Severity", "Description", "Flag Count"]
@@ -508,8 +643,12 @@ def build_dashboard(wb: Workbook, df: pd.DataFrame, flags: pd.DataFrame):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    df    = load_data(INPUT_PATH)
-    flags = run_validations(df)
+    df = load_data(INPUT_PATH)
+    df = compute_gross_pay(df)
+
+    validation_flags     = run_validations(df)
+    reconciliation_flags = run_reconciliations(df)
+    flags = pd.concat([validation_flags, reconciliation_flags], ignore_index=True)
 
     wb = Workbook()
     build_summary(wb, df, flags)
@@ -519,6 +658,8 @@ def main():
     wb.save(OUTPUT_PATH)
     print(f"Report saved → {OUTPUT_PATH}")
     print(f"Total flags  : {len(flags)}")
+    print(f"  Validation flags     : {len(validation_flags)}")
+    print(f"  Reconciliation flags : {len(reconciliation_flags)}")
     print(f"\nFlag breakdown:\n{flags['severity'].value_counts()}")
     print(f"\nFlags by rule:\n{flags['rule_id'].value_counts().sort_index()}")
 
