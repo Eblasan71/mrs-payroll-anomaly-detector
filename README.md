@@ -1,4 +1,4 @@
-# 🏗️ Payroll Anomaly Detector
+# Payroll Anomaly Detector
 ### Automated Pre-Processing Validation for U.S. Multi-State Payroll Operations
 
 ---
